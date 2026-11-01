@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-query-incremental",
-  "version": "0.1.0",
-  "description": "Incremental live indexing for DeepSeek Harness history search",
+  "version": "0.2.0",
+  "description": "Incremental indexing for DeepSeek Harness history search",
   "keywords": [
     "dsh",
     "deepseek-harness",

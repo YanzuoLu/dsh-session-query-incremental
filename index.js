@@ -1,14 +1,18 @@
 /**
- * Incremental live indexing for DeepSeek Harness (dsh) history search.
+ * Incremental indexing for DeepSeek Harness (dsh) history search.
  *
  * Before every search page the native SQLite backend re-observes every loaded
  * session: it deep-clones, serializes and hashes each complete event log, then
  * deletes and re-inserts all full-text documents of every session that grew.
- * With large running sessions this blocks the dsh event loop for tens of
- * seconds per search. Session logs are append-only, so this engine detects a
- * change from the session instance and its event count, and indexes only the
- * new events. A session is re-indexed in full only when new events reclassify
- * already indexed ones, which compaction does.
+ * Deleting a session's documents scans the whole full-text table, because
+ * `session_id` is an unindexed FTS5 column. With large sessions each search
+ * blocks the dsh event loop for tens of seconds.
+ *
+ * Session logs are append-only, so this engine detects a change from the
+ * session instance and its event count, and indexes only the new events. A
+ * live session is re-indexed in full only when new events reclassify already
+ * indexed ones, which compaction does. Every document's rowid is remembered,
+ * so removing a session's documents deletes exactly those rows.
  *
  * Search, ranking, cursors and the on-disk index stay native. This subclass
  * overrides internal methods of the dsh 0.2.0-rc.2 SQLite engine, so it pins
@@ -30,23 +34,28 @@ import { currentSessionMessageProjections } from '@deepseek-ai/dsh-session-forma
 const STABLE_OBSERVATION_ATTEMPTS = 2
 
 export default class IncrementalSqliteSessionQueryEngine extends SqliteSessionQueryEngine {
-  /** Index state of each live Session instance as of the last committed reconciliation. */
-  _indexed = new WeakMap()
-  /** Index states written by the reconciliation in progress, kept only if it commits. */
-  _pending
-  /** Live session whose replacement keeps its existing documents and appends new ones. */
-  _appending
+  /** Live index state per session id as of the last committed reconciliation. */
+  _live = new Map()
+  /** Rowids of each persisted session's documents, loaded on first use. */
+  _persisted
+  /** Index changes of the reconciliation in progress, applied only if it commits. A null value removes. */
+  _staged
   _instances = new WeakMap()
   _nextInstance = 0
 
   async _reconcile(signal) {
-    this._pending = new Map()
+    this._staged = { live: new Map(), persisted: new Map() }
     try {
       const binding = await super._reconcile(signal)
-      for (const [session, state] of this._pending) this._indexed.set(session, state)
+      for (const [id, state] of this._staged.live) state === null ? this._live.delete(id) : this._live.set(id, state)
+      for (const [id, rowids] of this._staged.persisted) rowids === null ? this._persisted.delete(id) : this._persisted.set(id, rowids)
       return binding
+    } catch (error) {
+      // The rowid index may have been read inside the rolled-back transaction.
+      this._persisted = undefined
+      throw error
     } finally {
-      this._pending = undefined
+      this._staged = undefined
     }
   }
 
@@ -115,17 +124,17 @@ export default class IncrementalSqliteSessionQueryEngine extends SqliteSessionQu
     }
   }
 
+  /** Write one changed live session, appending its new documents when the indexed ones still hold. */
   _replaceLiveSession(entry, generation, persisted) {
     const { session, events } = entry
     const id = entry.header.id
-    const previous = this._indexed.get(session)
-    const row = this._requireDb().prepare('SELECT fingerprint FROM temp.live_sessions WHERE id = ?').get(id)
-    let append = false
+    const db = this._requireDb()
+    const previous = this._liveState(id)
+    const row = db.prepare('SELECT fingerprint FROM temp.live_sessions WHERE id = ?').get(id)
     let documents
-    if (previous !== undefined && row?.fingerprint === previous.fingerprint) {
+    if (previous?.session === session && row?.fingerprint === previous.fingerprint) {
       const surfaces = classifySurface(events)
       if (sameSurfaces(previous.labels, surfaces)) {
-        append = true
         documents = []
         for (const event of events.slice(previous.count)) {
           const text = extractSessionEventText(event)
@@ -133,25 +142,81 @@ export default class IncrementalSqliteSessionQueryEngine extends SqliteSessionQu
         }
       }
     }
-    if (!append) documents = buildSessionEventSearchDocuments(id, events)
+    const append = documents !== undefined
+    if (!append) {
+      documents = buildSessionEventSearchDocuments(id, events)
+      if (row !== undefined) this._deleteLiveDocuments(id, previous)
+    }
+    db.prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(id)
+    db.prepare(`
+      INSERT INTO temp.live_sessions
+        (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, fingerprint, persisted, generation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(...headerBindings(entry.header, entry.inheritedEventCount), entry.fingerprint, persisted ? 1 : 0, generation)
     const labels = append ? new Map(previous.labels) : new Map()
     for (const document of documents) labels.set(document.seq, document.surface)
-    this._appending = append ? id : undefined
-    try {
-      super._replaceLiveSession({ ...entry, documents }, generation, persisted)
-    } finally {
-      this._appending = undefined
-    }
-    this._pending.set(session, { fingerprint: entry.fingerprint, count: events.length, labels })
+    const rowids = [...(append ? previous.rowids : []), ...this._insertDocuments('temp.live_docs', documents)]
+    this._staged.live.set(id, { session, fingerprint: entry.fingerprint, count: events.length, labels, rowids })
   }
 
-  /** Appending replaces the session row only, keeping its indexed documents. */
+  /** Write one changed persisted session, remembering its document rowids. */
+  _replacePersistedSession(entry, revision, generation) {
+    this._deleteSession('persisted', entry.header.id)
+    this._requireDb().prepare(`
+      INSERT INTO persisted_sessions
+        (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, revision, generation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(...headerBindings(entry.header, entry.inheritedEventCount), revision, generation)
+    this._staged.persisted.set(entry.header.id, this._insertDocuments('persisted_docs', entry.documents))
+  }
+
+  /** Remove one session's documents by rowid instead of scanning the full-text table. */
   _deleteSession(source, id) {
-    if (source === 'live' && id === this._appending) {
-      this._requireDb().prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(id)
-      return
+    const db = this._requireDb()
+    if (source === 'persisted') {
+      for (const rowid of this._persistedRowids(id)) db.prepare('DELETE FROM persisted_docs WHERE rowid = ?').run(rowid)
+      db.prepare('DELETE FROM persisted_sessions WHERE id = ?').run(id)
+      this._staged.persisted.set(id, null)
+    } else {
+      this._deleteLiveDocuments(id, this._liveState(id))
+      db.prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(id)
+      this._staged.live.set(id, null)
     }
-    super._deleteSession(source, id)
+  }
+
+  _liveState(id) {
+    return this._staged.live.has(id) ? this._staged.live.get(id) ?? undefined : this._live.get(id)
+  }
+
+  _deleteLiveDocuments(id, state) {
+    const db = this._requireDb()
+    if (state === undefined) db.prepare('DELETE FROM temp.live_docs WHERE session_id = ?').run(id)
+    else for (const rowid of state.rowids) db.prepare('DELETE FROM temp.live_docs WHERE rowid = ?').run(rowid)
+  }
+
+  _persistedRowids(id) {
+    if (this._staged.persisted.has(id)) return this._staged.persisted.get(id) ?? []
+    if (this._persisted === undefined) {
+      this._persisted = new Map()
+      for (const { rowid, session_id: sessionId } of this._requireDb().prepare('SELECT rowid, session_id FROM persisted_docs').all()) {
+        let rowids = this._persisted.get(sessionId)
+        if (rowids === undefined) this._persisted.set(sessionId, rowids = [])
+        rowids.push(rowid)
+      }
+    }
+    return this._persisted.get(id) ?? []
+  }
+
+  /** Insert documents exactly as the native engine does and return their rowids. */
+  _insertDocuments(table, documents) {
+    const insert = this._requireDb().prepare(`
+      INSERT INTO ${table} (text, session_id, seq, type, time, surface, codepoint_length)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    return documents.map((document) => {
+      const text = sanitizeFtsText(document.text)
+      return Number(insert.run(text, document.sessionId, document.seq, document.type, document.time, document.surface, Array.from(text).length).lastInsertRowid)
+    })
   }
 }
 
@@ -175,6 +240,23 @@ function sameSurfaces(indexed, surfaces) {
 }
 
 // The helpers below mirror the private ones of the native engine.
+
+function sanitizeFtsText(text) {
+  return text.replaceAll('\0', '\uFFFD').replaceAll('\uFDD0', '\uFFFD').replaceAll('\uFDD1', '\uFFFD')
+}
+
+function headerBindings(header, inheritedEventCount) {
+  return [
+    header.id,
+    header.version,
+    header.createdAt,
+    header.cwd ?? null,
+    header.parentSession ?? null,
+    header.isSeeded ? inheritedEventCount : null,
+    header.delegationDepth ?? null,
+    header.agentPreset ?? null,
+  ]
+}
 
 function materializePersistenceSnapshots(snapshots) {
   if (!Array.isArray(snapshots)) throw new Error('persistence snapshots must be an array')
