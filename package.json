@@ -1,0 +1,44 @@
+{
+  "name": "dsh-session-query-incremental",
+  "version": "0.1.0",
+  "description": "Incremental live indexing for DeepSeek Harness history search",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "session-query",
+    "sqlite",
+    "search"
+  ],
+  "license": "MIT",
+  "author": "Yanzuo Lu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YanzuoLu/dsh-session-query-incremental.git"
+  },
+  "homepage": "https://github.com/YanzuoLu/dsh-session-query-incremental#readme",
+  "bugs": {
+    "url": "https://github.com/YanzuoLu/dsh-session-query-incremental/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-format-catalog": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-query": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-query-sqlite": "0.2.0-rc.2"
+  }
+}

@@ -1,0 +1,4 @@
+# dsh-session-query-incremental bundle patch: mounts nothing. Point the profile's
+# history search index entry at this package instead of
+# '@deepseek-ai/dsh-session-query-sqlite', keeping its config.
+[]
